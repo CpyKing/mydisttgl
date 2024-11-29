@@ -165,6 +165,7 @@ if __name__ == '__main__':
     mb_local_rank = local_rank // args.minibatch_parallelism
     mb_offset = global_rank % args.minibatch_parallelism
     mb_tot_group_rank = mb_tot_rank // args.group       # Epoch Parallelism
+    epoch_parallelism = mb_tot_group_rank
     mb_group_rank = mb_global_rank % mb_tot_group_rank
     mb_group_id = mb_global_rank // mb_tot_group_rank
 
@@ -471,7 +472,7 @@ if __name__ == '__main__':
                 # torch.distributed.barrier()
                 # print_('here1\n\n')
                     
-
+                
                 # print('{}:iter {}/{} here1'.format(local_rank, i, train_iters - 1))
                 t_s = time.time()
                 t_train_s = time.time()
@@ -508,14 +509,14 @@ if __name__ == '__main__':
                 #         print("\n\n\n Expected \n\n\n")
                 #     else:
                 #         print("\n\n\n WRONG \n\n\n")
-                    
-                    
+    
                 t_s = time.time()
                 optimizer.zero_grad()
                 # torch.cuda.default_stream().wait_stream(mfg.stream)
                 if my_iter % mb_tot_group_rank == mb_group_rank:
                     write_buffer = WriteBuffer(group_rank, memory_write_buffer, mail_write_buffer, write_1idx_buffer, write_status)
                     # print('{} set write_buffer[{}] at iter {}'.format(local_rank, group_rank, i))
+                    
                     pred_pos, pred_neg = model(mfg, write_buffer=write_buffer)
                 else:
                     pred_pos, pred_neg = model(mfg)

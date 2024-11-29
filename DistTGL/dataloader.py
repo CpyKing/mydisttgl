@@ -6,16 +6,22 @@ import time
 import numpy as np
 from memorys import *
 from utils import *
+from get_config import *
+from gen_minibatch_online import OnlineSampler
 from threading import Thread
 
 class DataLoader:
-    def __init__(self, data, train_neg_samples, eval_neg_samples, sets, mode, minibatch_parallelism=1, mailbox=None, node_feats=None, edge_feats=None, edge_classification=False):
+    def __init__(self, data, train_neg_samples, eval_neg_samples, sets, mode, minibatch_parallelism=1, mailbox=None,
+                    node_feats=None, edge_feats=None, edge_classification=False, online_sampling=False):
+
         self.edge_classification = edge_classification
         if edge_classification:
             train_neg_samples = 0
             eval_neg_samples = 0
             sets = 0
         self.minibatch_parallelism = minibatch_parallelism
+        self.online_sampler = OnlineSampler(data, minibatch_parallelism, train_neg_samples, edge_classification=edge_classification)
+
         if mode == 'train' and minibatch_parallelism > 1:
             self.path = 'minibatches/{}_{}_{}_{}_{}/'.format(minibatch_parallelism, data, train_neg_samples, eval_neg_samples, sets)
         else:
@@ -23,9 +29,14 @@ class DataLoader:
         if mode != 'train':
             if not os.path.isfile(self.path + 'val_pos_0.pkl'):
                 self.path = 'minibatches/{}_{}_eval/'.format(data, eval_neg_samples)
+
         self.sets = sets
         self.mode = mode
-        self.tot_length = len([fn for fn in os.listdir(self.path) if fn.startswith('{}_pos'.format(mode))]) // minibatch_parallelism
+        self.online_sampling = online_sampling
+        if self.online_sampling and mode == 'train':
+            self.tot_length = self.online_sampler.get_tot_length()
+        else:
+            self.tot_length = len([fn for fn in os.listdir(self.path) if fn.startswith('{}_pos'.format(mode))]) // minibatch_parallelism
         self.idx = 0
         self.rng = np.random.default_rng()
         self.mailbox = mailbox
@@ -38,6 +49,7 @@ class DataLoader:
         self.mail_read_buffer = None
         self.read_1idx_buffer = None
         self.read_status = None
+        
 
     def __iter__(self):
         self.idx = 0
@@ -83,44 +95,77 @@ class DataLoader:
 
     def _load_and_slice_mfgs(self, pos_idx, neg_idxs, zero_mails=False):
         # only usable in training set
-        t_s = time.time()
-        with open('{}{}_pos_{}.pkl'.format(self.path, self.mode, pos_idx), 'rb') as f:
-            pos_mfg = pickle.load(f)
-        if not self.edge_classification:
-            for idx, neg_idx in enumerate(neg_idxs):
-                with open('{}{}_neg_{}_{}.pkl'.format(self.path, self.mode, pos_idx, neg_idx), 'rb') as f:
-                    neg_mfg = pickle.load(f)
-                mfg = combine_mfgs(pos_mfg, neg_mfg)
+        if self.online_sampling:
+            if not self.edge_classification:
+                pos_mfg, neg_mfgs = next(self.iterable_online_sampler)
+                for idx, neg_mfg in enumerate(neg_mfgs):
+                    mfg = combine_mfgs(pos_mfg, neg_mfg)
+                    prepare_input(mfg, self.node_feats, self.edge_feats)
+                    self.prefetched_mfgs[idx] = mfg
+                    if zero_mails:
+                        num_nodes = mfg.srcdata['ID'].shape[0]
+                        mfg.srcdata['mem'] = torch.zeros((num_nodes, self.mailbox.node_memory.shape[1]), device=mfg.srcdata['ID'].device)
+                        mfg.srcdata['mail'] = torch.zeros((num_nodes, self.mailbox.mailbox.shape[1]), device=mfg.srcdata['ID'].device)
+                    else:
+                        self.read_1idx_buffer[self.rank][idx][0] = mfg.srcdata['ID'].shape[0]
+                        self.read_1idx_buffer[self.rank][idx][1:1 + mfg.srcdata['ID'].shape[0]].copy_(mfg.srcdata['ID'])
+            else:
+                pos_mfg, neg_mfgs = next(self.iterable_online_sampler)
+                mfg = pos_mfg
+                mfg.combined = False
                 prepare_input(mfg, self.node_feats, self.edge_feats)
-                self.prefetched_mfgs[idx] = mfg
+                self.prefetched_mfgs[0] = mfg
                 if zero_mails:
                     num_nodes = mfg.srcdata['ID'].shape[0]
                     mfg.srcdata['mem'] = torch.zeros((num_nodes, self.mailbox.node_memory.shape[1]), device=mfg.srcdata['ID'].device)
                     mfg.srcdata['mail'] = torch.zeros((num_nodes, self.mailbox.mailbox.shape[1]), device=mfg.srcdata['ID'].device)
                 else:
-                    self.read_1idx_buffer[self.rank][idx][0] = mfg.srcdata['ID'].shape[0]
-                    self.read_1idx_buffer[self.rank][idx][1:1 + mfg.srcdata['ID'].shape[0]].copy_(mfg.srcdata['ID'])
-        else:
-            mfg = pos_mfg
-            mfg.combined = False
-            prepare_input(mfg, self.node_feats, self.edge_feats)
-            self.prefetched_mfgs[0] = mfg
-            if zero_mails:
-                num_nodes = mfg.srcdata['ID'].shape[0]
-                mfg.srcdata['mem'] = torch.zeros((num_nodes, self.mailbox.node_memory.shape[1]), device=mfg.srcdata['ID'].device)
-                mfg.srcdata['mail'] = torch.zeros((num_nodes, self.mailbox.mailbox.shape[1]), device=mfg.srcdata['ID'].device)
+                    self.read_1idx_buffer[self.rank][0][0] = mfg.srcdata['ID'].shape[0]
+                    self.read_1idx_buffer[self.rank][0][1:1 + mfg.srcdata['ID'].shape[0]].copy_(mfg.srcdata['ID'])
+            if not zero_mails:
+                self.read_status[self.rank] = 1
+                # print('here2 read_status:', self.read_status.data_ptr(), self.read_status)
+        else: 
+            t_s = time.time()
+            with open('{}{}_pos_{}.pkl'.format(self.path, self.mode, pos_idx), 'rb') as f:
+                pos_mfg = pickle.load(f)
+            if not self.edge_classification:
+                for idx, neg_idx in enumerate(neg_idxs):
+                    with open('{}{}_neg_{}_{}.pkl'.format(self.path, self.mode, pos_idx, neg_idx), 'rb') as f:
+                        neg_mfg = pickle.load(f)
+                    mfg = combine_mfgs(pos_mfg, neg_mfg)
+                    prepare_input(mfg, self.node_feats, self.edge_feats)
+                    self.prefetched_mfgs[idx] = mfg
+                    if zero_mails:
+                        num_nodes = mfg.srcdata['ID'].shape[0]
+                        mfg.srcdata['mem'] = torch.zeros((num_nodes, self.mailbox.node_memory.shape[1]), device=mfg.srcdata['ID'].device)
+                        mfg.srcdata['mail'] = torch.zeros((num_nodes, self.mailbox.mailbox.shape[1]), device=mfg.srcdata['ID'].device)
+                    else:
+                        self.read_1idx_buffer[self.rank][idx][0] = mfg.srcdata['ID'].shape[0]
+                        self.read_1idx_buffer[self.rank][idx][1:1 + mfg.srcdata['ID'].shape[0]].copy_(mfg.srcdata['ID'])
             else:
-                self.read_1idx_buffer[self.rank][0][0] = mfg.srcdata['ID'].shape[0]
-                self.read_1idx_buffer[self.rank][0][1:1 + mfg.srcdata['ID'].shape[0]].copy_(mfg.srcdata['ID'])
-        if not zero_mails:
-            self.read_status[self.rank] = 1
-            # print('here2 read_status:', self.read_status.data_ptr(), self.read_status)
+                mfg = pos_mfg
+                mfg.combined = False
+                prepare_input(mfg, self.node_feats, self.edge_feats)
+                self.prefetched_mfgs[0] = mfg
+                if zero_mails:
+                    num_nodes = mfg.srcdata['ID'].shape[0]
+                    mfg.srcdata['mem'] = torch.zeros((num_nodes, self.mailbox.node_memory.shape[1]), device=mfg.srcdata['ID'].device)
+                    mfg.srcdata['mail'] = torch.zeros((num_nodes, self.mailbox.mailbox.shape[1]), device=mfg.srcdata['ID'].device)
+                else:
+                    self.read_1idx_buffer[self.rank][0][0] = mfg.srcdata['ID'].shape[0]
+                    self.read_1idx_buffer[self.rank][0][1:1 + mfg.srcdata['ID'].shape[0]].copy_(mfg.srcdata['ID'])
+            if not zero_mails:
+                self.read_status[self.rank] = 1
+                # print('here2 read_status:', self.read_status.data_ptr(), self.read_status)
         return
 
     def init_prefetch(self, idx, num_neg=1, offset=0, prefetch_interval=1, rank=None, memory_read_buffer=None, mail_read_buffer=None, read_1idx_buffer=None, read_status=None):
         # initilize and prefetch the first minibatches with all zero node memory and mails
         # only works in training
 
+        self.online_sampler.initial_sampling(num_neg, offset)
+        self.iterable_online_sampler = self.online_sampler.next()
         self.rank = rank
         self.memory_read_buffer = memory_read_buffer
         self.mail_read_buffer = mail_read_buffer
@@ -130,7 +175,7 @@ class DataLoader:
 
         self.prefetch_interval = prefetch_interval
         self.prefetch_offset = offset
-        self.prefetch_num_neg = num_neg
+        self.prefetch_num_neg = num_neg # vlaue same as epoch parallelism
         self.next_prefetch_idx = idx + prefetch_interval
 
         self.fetched_mfgs = list()
@@ -187,7 +232,6 @@ class DataLoader:
                 else:
                     neg_idx = None
                 neg_idxs.append(neg_idx)
-            # print('launch prefetch thread to prefetch {}'.format(pos_idx))
             self.prefetch_thread = Thread(target=self._load_and_slice_mfgs, args=(pos_idx, neg_idxs))
             self.prefetch_thread.start()
 
